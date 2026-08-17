@@ -34,6 +34,7 @@ Optional:
   ANTHROPIC_MODEL                (default "claude-sonnet-4-5")
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -577,7 +578,7 @@ def extract_receipt(file_bytes: bytes, media_type: str) -> dict:
     if not ANTHROPIC_API_KEY:
         raise RuntimeError("ANTHROPIC_API_KEY is not set.")
 
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY, timeout=60.0)
     data_b64 = base64.b64encode(file_bytes).decode("ascii")
     if media_type == "application/pdf":
         content_block = {
@@ -655,6 +656,30 @@ def format_item_preview(item) -> str:
     return f"- {item.get('item_name', 'Item')} x{qty} @ ${price:.2f}"
 
 
+async def safe_edit(status_msg, fallback_chat_msg, text, **kwargs):
+    """Edit a status message, but never let a failed edit swallow the result.
+
+    Telegram occasionally refuses to edit a message (rate limits, timing,
+    client-side quirks) and raises telegram.error.BadRequest. If that
+    happens here, send the text as a brand-new message instead of losing
+    it - the user should always see the outcome of a receipt scan.
+    """
+    try:
+        await status_msg.edit_text(text, **kwargs)
+    except Exception:
+        logger.exception("Couldn't edit status message, sending a new one instead")
+        await fallback_chat_msg.reply_text(text, **kwargs)
+
+
+async def safe_edit_query(query, text, **kwargs):
+    """Same idea as safe_edit(), for callback-query messages (the Add/Discard buttons)."""
+    try:
+        await query.edit_message_text(text, **kwargs)
+    except Exception:
+        logger.exception("Couldn't edit message via callback, sending a new one instead")
+        await query.message.reply_text(text, **kwargs)
+
+
 @restricted
 async def receipt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -684,15 +709,23 @@ async def receipt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await msg.reply_text("Reading receipt...", reply_markup=ReplyKeyboardRemove())
     try:
         raw = await tg_file.download_as_bytearray()
-        parsed = extract_receipt(bytes(raw), media_type)
+        # extract_receipt() is a blocking (synchronous) network call - run it in a
+        # worker thread so it can't freeze the bot's whole event loop while it waits.
+        parsed = await asyncio.wait_for(
+            asyncio.to_thread(extract_receipt, bytes(raw), media_type), timeout=90
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Receipt extraction timed out")
+        await safe_edit(status, msg, "That took too long and timed out - try again, or use /add instead.")
+        return
     except Exception:
         logger.exception("Receipt extraction failed")
-        await status.edit_text("Couldn't read that receipt - try a clearer photo, or use /add instead.")
+        await safe_edit(status, msg, "Couldn't read that receipt - try a clearer photo, or use /add instead.")
         return
 
     items = (parsed or {}).get("items") or []
     if not items:
-        await status.edit_text("Didn't find any purchase line items on that receipt.")
+        await safe_edit(status, msg, "Didn't find any purchase line items on that receipt.")
         return
 
     rid = uuid.uuid4().hex[:8]
@@ -710,7 +743,7 @@ async def receipt_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         ]
     )
-    await status.edit_text("\n".join(lines))
+    await safe_edit(status, msg, "\n".join(lines))
     await msg.reply_text("Confirm below:", reply_markup=keyboard)
 
 
@@ -723,11 +756,11 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = pending.pop(rid, None)
 
     if parsed is None:
-        await query.edit_message_text("This receipt was already handled (or the bot restarted).")
+        await safe_edit_query(query, "This receipt was already handled (or the bot restarted).")
         return
 
     if action == "receipt_discard":
-        await query.edit_message_text("Discarded - nothing added.")
+        await safe_edit_query(query, "Discarded - nothing added.")
         return
 
     retailer = parsed.get("retailer") or "Unknown"
@@ -763,7 +796,21 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             e_row += 1
             added += 1
 
-    await query.edit_message_text(f"Added {added} item(s) to the inventory sheet.")
+    await safe_edit_query(query, f"Added {added} item(s) to the inventory sheet.")
+
+
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    """Catch-all so an unexpected bug never fails silently in the logs -
+    and, where possible, tells the user something went wrong instead of
+    leaving them waiting with no reply at all."""
+    logger.exception("Unhandled error while processing an update", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "Something went wrong handling that - try again, or use /add instead."
+            )
+    except Exception:
+        logger.exception("Also failed to notify the user about the error")
 
 
 # --------------------------------------------------------------------------
@@ -771,6 +818,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
+    app.add_error_handler(on_error)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", start))
