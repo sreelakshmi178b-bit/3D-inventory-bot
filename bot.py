@@ -15,6 +15,10 @@ prefers typing them directly:
   /summary               - totals from the Summary tab
   /cancel                - abort an in-progress /add flow
 
+Send a photo or PDF of a receipt directly in the chat to have Claude read it
+and propose purchase line items to add - you confirm with a button before
+anything is written to the sheet.
+
 Reads/writes the same Google Sheet tabs produced by the original workbook:
   "Filament Inventory", "Equipment & Other Items", "Summary"
 
@@ -26,26 +30,42 @@ Optional:
   TELEGRAM_ALLOWED_USER_IDS      (comma-separated Telegram user IDs; if unset,
                                    ANYONE who finds the bot can use it)
   LOW_STOCK_THRESHOLD_KG         (default 0.2)
+  ANTHROPIC_API_KEY              (needed only for the receipt-photo feature)
+  ANTHROPIC_MODEL                (default "claude-sonnet-4-5")
 """
 
+import base64
 import json
 import logging
 import os
 import re
+import uuid
 from datetime import date
 from functools import wraps
 
 import gspread
 from google.oauth2.service_account import Credentials
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     MessageHandler,
     filters,
 )
+
+try:
+    import anthropic
+except ImportError:  # receipt scanning is optional; rest of the bot still works
+    anthropic = None
 
 logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s", level=logging.INFO
@@ -62,13 +82,16 @@ ALLOWED_USER_IDS = {
     int(x) for x in os.environ.get("TELEGRAM_ALLOWED_USER_IDS", "").split(",") if x.strip()
 }
 LOW_STOCK_THRESHOLD_KG = float(os.environ.get("LOW_STOCK_THRESHOLD_KG", "0.2"))
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")  # optional - only for receipt scanning
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
 
 FILAMENT_SHEET = "Filament Inventory"
 EQUIPMENT_SHEET = "Equipment & Other Items"
 SUMMARY_SHEET = "Summary"
 HEADER_ROW = 4  # row 4 in the workbook holds the column headers
 WEIGHT_USED_COL = 10  # column J
-FORMAT_COL_INDEX = 5  # column F, 0-indexed (used to find the "TOTALS" marker row)
+FORMAT_COL_INDEX = 5  # column F, 0-indexed (used to find the "TOTALS" marker row on the Filament sheet)
+EQUIPMENT_ITEM_COL_INDEX = 2  # column C, 0-indexed (used to find "TOTALS" on the Equipment sheet)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -148,12 +171,24 @@ def restricted(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         if ALLOWED_USER_IDS and (user is None or user.id not in ALLOWED_USER_IDS):
-            await update.message.reply_text("Sorry, this bot is private.")
             logger.warning("Blocked unauthorized user %s", user.id if user else "unknown")
+            if update.message:
+                await update.message.reply_text("Sorry, this bot is private.")
+            elif update.callback_query:
+                await update.callback_query.answer("Not authorized.", show_alert=True)
             return
         return await func(update, context)
 
     return wrapper
+
+
+def find_totals_row_index(values, marker_col_index, marker_text="TOTALS"):
+    """Row number (1-indexed) of the first row whose marker_col_index cell
+    equals marker_text - falls back to appending at the end if not found."""
+    for i, row in enumerate(values, start=1):
+        if len(row) > marker_col_index and row[marker_col_index].strip().upper() == marker_text:
+            return i
+    return len(values) + 1
 
 
 # --------------------------------------------------------------------------
@@ -265,7 +300,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/used <search> <grams> - log filament consumed, e.g. /used charcoal matte 200\n"
         "/add - log a new purchase\n"
         "/summary - spending summary\n"
-        "/cancel - cancel an /add in progress",
+        "/cancel - cancel an /add in progress\n\n"
+        "You can also just send a photo or PDF of a receipt and I'll read it "
+        "and propose what to add.",
         reply_markup=MAIN_MENU,
     )
 
@@ -279,239 +316,4 @@ async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(stock_lookup_text(query), reply_markup=MAIN_MENU)
 
 
-@restricted
-async def lowstock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    threshold = LOW_STOCK_THRESHOLD_KG
-    if context.args:
-        threshold = parse_float(context.args[0], LOW_STOCK_THRESHOLD_KG)
-    await update.message.reply_text(lowstock_text(threshold), reply_markup=MAIN_MENU)
-
-
-@restricted
-async def used(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /used <search term> <grams>, e.g. /used charcoal matte 200")
-        return
-    *query_parts, grams_str = context.args
-    query = " ".join(query_parts)
-    grams = parse_float(grams_str)
-    await update.message.reply_text(used_apply_text(query, grams), reply_markup=MAIN_MENU)
-
-
-@restricted
-async def summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(summary_text(), reply_markup=MAIN_MENU)
-
-
-# --------------------------------------------------------------------------
-# Button menu handler (Check Stock / Low Stock / Log Usage / Summary)
-# "Add Purchase" is handled separately below, as an entry point into the
-# /add ConversationHandler, since it needs a multi-step guided flow.
-# --------------------------------------------------------------------------
-@restricted
-async def menu_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-
-    # Follow-up answer to a pending "Check Stock" button tap
-    if context.user_data.get(AWAITING_STOCK):
-        context.user_data.pop(AWAITING_STOCK, None)
-        await update.message.reply_text(stock_lookup_text(text), reply_markup=MAIN_MENU)
-        return
-
-    # Follow-up answer to a pending "Log Usage" button tap
-    if context.user_data.get(AWAITING_USED):
-        context.user_data.pop(AWAITING_USED, None)
-        query, grams = split_query_and_grams(text)
-        if query is None:
-            await update.message.reply_text(
-                "Couldn't read that - send it like 'charcoal matte 200' "
-                "(search term, then grams).",
-                reply_markup=MAIN_MENU,
-            )
-            return
-        await update.message.reply_text(used_apply_text(query, grams), reply_markup=MAIN_MENU)
-        return
-
-    # A main-menu button was tapped
-    if text == BTN_STOCK:
-        context.user_data[AWAITING_STOCK] = True
-        await update.message.reply_text(
-            "Which material or color? (e.g. charcoal)", reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    if text == BTN_LOWSTOCK:
-        await update.message.reply_text(lowstock_text(LOW_STOCK_THRESHOLD_KG), reply_markup=MAIN_MENU)
-        return
-
-    if text == BTN_USED:
-        context.user_data[AWAITING_USED] = True
-        await update.message.reply_text(
-            "Which material/color, and how many grams? e.g. 'charcoal matte 200'",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return
-
-    if text == BTN_SUMMARY:
-        await update.message.reply_text(summary_text(), reply_markup=MAIN_MENU)
-        return
-
-    # Anything else that isn't a recognized button or a pending follow-up
-    await update.message.reply_text(
-        "Not sure what you mean - use the buttons below, or /help for commands.",
-        reply_markup=MAIN_MENU,
-    )
-
-
-# --------------------------------------------------------------------------
-# /add conversation
-# --------------------------------------------------------------------------
-MATERIAL, COLOR, FORMAT, WEIGHT, QTY, PRICE, RETAILER = range(7)
-
-
-@restricted
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_row"] = {}
-    await update.message.reply_text(
-        "Adding a new filament purchase. What material? (e.g. PLA Matte)\n"
-        "Send /cancel anytime to stop."
-    )
-    return MATERIAL
-
-
-async def add_material(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_row"]["material"] = update.message.text.strip()
-    await update.message.reply_text("Color?")
-    return COLOR
-
-
-async def add_color(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_row"]["color"] = update.message.text.strip()
-    await update.message.reply_text(
-        "Format?",
-        reply_markup=ReplyKeyboardMarkup(
-            [["Spool", "Refill"]], one_time_keyboard=True, resize_keyboard=True
-        ),
-    )
-    return FORMAT
-
-
-async def add_format(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_row"]["format"] = update.message.text.strip()
-    await update.message.reply_text(
-        "Weight per unit in kg? (usually 1)", reply_markup=ReplyKeyboardRemove()
-    )
-    return WEIGHT
-
-
-async def add_weight(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_row"]["weight"] = parse_float(update.message.text, 1.0)
-    await update.message.reply_text("Quantity purchased?")
-    return QTY
-
-
-async def add_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_row"]["qty"] = int(parse_float(update.message.text, 1))
-    await update.message.reply_text("Unit price paid, in CAD?")
-    return PRICE
-
-
-async def add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["new_row"]["price"] = parse_float(update.message.text, 0)
-    await update.message.reply_text("Retailer? (e.g. Bambu Lab, Amazon.ca)")
-    return RETAILER
-
-
-async def add_retailer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    d = context.user_data["new_row"]
-    d["retailer"] = update.message.text.strip()
-
-    ws = get_ws(FILAMENT_SHEET)
-    values = ws.get_all_values()
-    totals_row_idx = None
-    for i, row in enumerate(values, start=1):
-        if len(row) > FORMAT_COL_INDEX and row[FORMAT_COL_INDEX].strip().upper() == "TOTALS":
-            totals_row_idx = i
-            break
-    if totals_row_idx is None:
-        totals_row_idx = len(values) + 1
-
-    r = totals_row_idx  # the new row will land here; everything below shifts down
-    row_values = [
-        date.today().isoformat(),
-        d["retailer"],
-        d["retailer"],
-        d["material"],
-        d["color"],
-        d["format"],
-        d["weight"],
-        d["qty"],
-        f"=G{r}*H{r}",
-        0,
-        f"=I{r}-J{r}",
-        "",
-        "",
-        d["price"],
-        0,
-        0,
-        f"=N{r}-O{r}+P{r}",
-    ]
-    ws.insert_row(row_values, index=totals_row_idx, value_input_option="USER_ENTERED")
-
-    await update.message.reply_text(
-        f"Added: {d['material']} - {d['color']} ({d['format']}), "
-        f"{d['qty']} x {d['weight']}kg @ ${d['price']:.2f} from {d['retailer']}.",
-        reply_markup=MAIN_MENU,
-    )
-    context.user_data.pop("new_row", None)
-    return ConversationHandler.END
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("new_row", None)
-    await update.message.reply_text("Cancelled.", reply_markup=MAIN_MENU)
-    return ConversationHandler.END
-
-
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", start))
-    app.add_handler(CommandHandler("stock", stock))
-    app.add_handler(CommandHandler("lowstock", lowstock))
-    app.add_handler(CommandHandler("used", used))
-    app.add_handler(CommandHandler("summary", summary))
-
-    add_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("add", add_start),
-            MessageHandler(filters.Regex(f"^{re.escape(BTN_ADD)}$"), add_start),
-        ],
-        states={
-            MATERIAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_material)],
-            COLOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_color)],
-            FORMAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_format)],
-            WEIGHT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_weight)],
-            QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_qty)],
-            PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_price)],
-            RETAILER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_retailer)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(add_conv)
-
-    # Catches button taps and follow-up answers for Check Stock / Low Stock /
-    # Log Usage / Summary. Registered after add_conv so an active /add flow
-    # (or a fresh "Add Purchase" tap) is handled by add_conv first.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_text))
-
-    logger.info("Bot starting...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
+@r
