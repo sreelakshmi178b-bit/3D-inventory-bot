@@ -1,3 +1,4 @@
+
 """
 Telegram bot for the 3D printing filament & inventory Google Sheet.
 
@@ -755,12 +756,19 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = context.user_data.get("pending_receipts", {})
     parsed = pending.pop(rid, None)
 
+    # Explicitly clear the inline keyboard on the way out so these buttons
+    # can never be tapped a second time (Telegram otherwise leaves an
+    # already-used button row sitting on screen and tappable).
+    no_buttons = InlineKeyboardMarkup([])
+
     if parsed is None:
-        await safe_edit_query(query, "This receipt was already handled (or the bot restarted).")
+        await safe_edit_query(
+            query, "This receipt was already handled (or the bot restarted).", reply_markup=no_buttons
+        )
         return
 
     if action == "receipt_discard":
-        await safe_edit_query(query, "Discarded - nothing added.")
+        await safe_edit_query(query, "Discarded - nothing added.", reply_markup=no_buttons)
         return
 
     retailer = parsed.get("retailer") or "Unknown"
@@ -796,7 +804,7 @@ async def receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             e_row += 1
             added += 1
 
-    await safe_edit_query(query, f"Added {added} item(s) to the inventory sheet.")
+    await safe_edit_query(query, f"Added {added} item(s) to the inventory sheet.", reply_markup=no_buttons)
 
 
 async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
